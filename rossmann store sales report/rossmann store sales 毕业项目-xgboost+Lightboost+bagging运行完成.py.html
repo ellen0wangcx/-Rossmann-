@@ -1,0 +1,851 @@
+
+# coding: utf-8
+
+# In[1]:
+
+
+#插入第三方库
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
+from pandas import datetime
+#数据可视化库
+from matplotlib import pylab as plt
+import seaborn as sns
+import datetime
+import time
+from sklearn.cross_validation import train_test_split
+from sklearn import cross_validation
+import xgboost as xgb
+
+from xgboost.sklearn import XGBClassifier
+import operator
+
+
+# In[2]:
+
+
+#加载数据集
+store=pd.read_csv("store.csv", low_memory=False)
+#read_csv参数：parse_dates解析索引,index_col用作行索引的列编号，low_memory分块加载到内存，再低内存消耗中解析
+train=pd.read_csv("train.csv", parse_dates=[2], low_memory=False)     #,index_col='Date')
+test=pd.read_csv('test.csv', parse_dates=[3],low_memory=False)
+
+
+# In[3]:
+
+
+store['CompetitionDistance'].fillna(store['CompetitionDistance'].median(), inplace=True)
+#store['CompetitionDistance'].describe()
+
+
+# In[4]:
+
+
+store.fillna(0,inplace=True)
+
+
+# In[5]:
+
+
+test.fillna(1,inplace=True)
+
+
+# In[6]:
+
+
+#合并数据集store&train为新的数据训练集train_new
+train=pd.merge(train, store, on='Store')
+test = pd.merge(test, store, on='Store')
+#train_new.describe()
+
+
+# In[7]:
+
+
+train = train.sort_values(['Date'],ascending = False)
+valid = train[:6*7*1115]
+train= train[6*7*1115:]
+
+
+# In[8]:
+
+
+#提取开门并有销售额特征，填充缺失值
+train=train[train["Open"]!=0]
+train = train[train["Sales"]>0]
+valid=valid[valid['Open']!=0]
+valid=valid[valid['Sales']>0]
+#train.fillna(train.median(), inplace=True)
+#train['Open'].describe()
+
+
+# In[9]:
+
+
+#特征工程
+
+
+# In[10]:
+
+
+def features_create(data):
+    
+    
+    mappings = {'0':0, 'a':1, 'b':2, 'c':3, 'd':4}
+    data.StoreType.replace(mappings, inplace=True)
+    data.Assortment.replace(mappings, inplace=True)
+    data.StateHoliday.replace(mappings, inplace=True)
+    
+    
+    data['Year'] = data.Date.dt.year
+    data['Month'] = data.Date.dt.month
+    data['Day'] = data.Date.dt.day
+    data['DayOfWeek'] = data.Date.dt.dayofweek
+    data['WeekOfYear'] = data.Date.dt.weekofyear
+    
+    
+    
+    data['CompetitionOpen'] = 12 * (data.Year - data.CompetitionOpenSinceYear) +         (data.Month - data.CompetitionOpenSinceMonth)
+    data['PromoOpen'] = 12 * (data.Year - data.Promo2SinceYear) +         (data.WeekOfYear - data.Promo2SinceWeek) / 4.0
+    data['CompetitionOpen'] = data.CompetitionOpen.apply(lambda x: x if x > 0 else 0)        
+    data['PromoOpen'] = data.PromoOpen.apply(lambda x: x if x > 0 else 0)
+    
+    
+  
+    month2str = {1:'Jan', 2:'Feb', 3:'Mar', 4:'Apr', 5:'May', 6:'Jun', 7:'Jul', 8:'Aug', 9:'Sept', 10:'Oct', 11:'Nov', 12:'Dec'}
+    data['monthStr'] = data.Month.map(month2str)
+    data.loc[data.PromoInterval == 0, 'PromoInterval'] = ''
+    data['IsPromoMonth'] = 0
+    for interval in data.PromoInterval.unique():
+        if interval != '':
+            for month in interval.split(','):
+                data.loc[(data.monthStr == month) & (data.PromoInterval == interval), 'IsPromoMonth'] = 1
+
+    return data
+
+
+# In[11]:
+
+
+features_create(train)
+features_create(valid)
+features_create(test)
+print('Features creation finished')
+
+
+# In[12]:
+
+
+train.drop(['PromoInterval'],axis=1,inplace=True)
+valid.drop(['PromoInterval'],axis=1,inplace=True)
+
+
+# In[13]:
+
+
+train.drop(['Date'],axis=1,inplace=True)
+valid.drop(['Date'],axis=1,inplace=True)
+
+
+# In[14]:
+
+
+train.drop(['Customers'],axis=1,inplace=True)
+valid.drop(['Customers'],axis=1,inplace=True)
+
+
+# In[15]:
+
+
+train.drop(['Open'],axis=1,inplace=True)
+valid.drop(['Open'],axis=1,inplace=True)
+
+
+# In[16]:
+
+
+train.drop(['monthStr'],axis=1,inplace=True)
+valid.drop(['monthStr'],axis=1,inplace=True)
+
+
+# In[17]:
+
+
+#XGBoost模型训练
+
+
+# In[18]:
+
+
+def rmspe(y, yhat):
+    return np.sqrt(np.mean((yhat / y - 1) ** 2))  
+
+
+# In[19]:
+
+
+def rmspe_xg(yhat, y):
+    y = np.exp(y.get_label())
+    yhat = np.exp(yhat)
+    return "rmspe", rmspe(y, yhat)
+
+
+# In[20]:
+
+
+#XGBoost模型—线性回归参数设置
+params={
+'booster':'gbtree',
+'objective': 'reg:linear', #线性回归问题
+'gamma':0.1,  # 用于控制是否后剪枝的参数,越大越保守，一般0.1、0.2这样子。
+'max_depth':10, # 构建树的深度，越大越容易过拟合
+'lambda':2,  # 控制模型复杂度的权重值的L2正则化项参数，参数越大，模型越不容易过拟合。
+'subsample':0.9, # 随机采样训练样本
+'colsample_bytree':0.7, # 生成树时进行的列采样
+'min_child_weight':3, 
+# 这个参数默认是 1，是每个叶子里面 h 的和至少是多少，对正负样本不均衡时的 0-1 分类而言
+#，假设 h 在 0.01 附近，min_child_weight 为 1 意味着叶子节点中最少需要包含 100 个样本。
+#这个参数非常影响结果，控制叶子节点中二阶导的和的最小值，该参数值越小，越容易 overfitting。 
+'silent':1 ,#设置成1则没有运行信息输出，最好是设置为0.
+'eta': 0.03, # 如同学习率
+'seed':10,
+'nthread':7,# cpu 线程数
+#'eval_metric': 'auc'
+}
+plst = list(params.items())
+num_rounds = 4000# 迭代次数
+
+
+# In[21]:
+
+
+print("Train a XGBoost model")
+#x_train, x_valid = train_test_split(train, test_size=0.2, random_state=10)
+#x_train, x_valid=cross_validation.train_test_split(train,test_size=0.2,random_state=10)
+x_train=train.drop(['Sales'],axis=1)
+x_valid=valid.drop(['Sales'],axis=1)
+y_train = np.log(train.Sales)
+y_valid = np.log(valid.Sales)
+dtrain = xgb.DMatrix(x_train, y_train)
+dvalid = xgb.DMatrix(x_valid, y_valid)
+
+
+# In[22]:
+
+
+x_test=test.drop(['Id','Date','Open','PromoInterval','monthStr'],axis=1)
+
+
+# In[23]:
+
+
+#记录程序运行时间
+start_time=time.time()
+
+
+# In[24]:
+
+
+watchlist = [(dtrain, 'train'), (dvalid, 'valid')]
+gbm = xgb.train(params, dtrain, num_rounds, evals=watchlist, early_stopping_rounds=100,feval=rmspe_xg, verbose_eval=True)
+ 
+
+
+# In[25]:
+
+
+cost_time=time.time()-start_time
+print("xgboost success!",'\n',"cost time:",cost_time,"(s)......")
+
+
+# In[26]:
+
+
+print("Validating")
+x_valid.sort_index(inplace=True)
+y_valid.sort_index(inplace=True)
+yhat = gbm.predict(xgb.DMatrix(x_valid))
+error = rmspe(np.exp(y_valid), np.exp(yhat))
+print('RMSPE: {:.6f}'.format(error))
+
+
+# In[27]:
+
+
+#读入验证集数据
+df = pd.DataFrame(data = y_valid)
+df['Prediction']=yhat
+df = pd.merge(x_valid,df, left_index= True, right_index=True)
+df['Ratio'] = df.Prediction/df.Sales
+df['Error'] =abs(df.Ratio-1)
+df['Weight'] = df.Sales/df.Prediction
+df.head()
+
+
+# In[28]:
+
+
+#验证集中任意三个店铺预测结果
+
+
+# In[29]:
+
+
+col_1 = ['Sales','Prediction']
+col_2 = ['Ratio']
+L=np.random.randint( low=1,high = 1115, size = 3 ) 
+print('XGB Mean Ratio of predition and real sales data is {}: store all'.format(df.Ratio.mean()))
+for i in L:
+    
+    s1 = pd.DataFrame(df[df['Store']==i],columns = col_1)
+    s2 = pd.DataFrame(df[df['Store']==i],columns = col_2)
+    s1.plot(title = 'XGB Comparation of predition and real sales data: store {}'.format(i),figsize=(12,4))
+    s2.plot(title = 'XGB Ratio of predition and real sales data: store {}'.format(i),figsize=(12,4))
+    print('XGB Mean Ratio of predition and real sales data is {}: store {}'.format(s2.Ratio.mean(),i))
+
+
+# In[30]:
+
+
+#分析偏差最大的十个预测结果
+
+
+# In[31]:
+
+
+df.sort_values(['Error'],ascending=False,inplace= True)
+df[:10]
+
+
+# In[32]:
+
+
+#计算总体权重
+print("XGBoosting weight correction")
+W=[(0.990+(i/1000)) for i in range(20)]
+S =[]
+for w in W:
+    error = rmspe(np.exp(y_valid), np.exp(yhat*w))
+    print('RMSPE for {:.3f}:{:.6f}'.format(w,error))
+    S.append(error)
+Score = pd.Series(S,index=W)
+Score.plot()
+BS = Score[Score.values == Score.values.min()]
+print ('XGB Best weight for Score:{}'.format(BS))
+
+
+# In[33]:
+
+
+#每家店铺校正偏差
+
+
+# In[34]:
+
+
+L=range(1115)
+W_valid=[]
+W_test=[]
+for i in L:
+    s1 = pd.DataFrame(df[df['Store']==i+1],columns = col_1)
+    s2 = pd.DataFrame(x_test[x_test['Store']==i+1])
+    W1=[(0.990+(i/1000)) for i in range(20)]
+    S =[]
+    for w in W1:
+        error = rmspe(np.exp(s1.Sales), np.exp(s1.Prediction*w))
+        S.append(error)
+    Score = pd.Series(S,index=W1)
+    BS = Score[Score.values == Score.values.min()]
+    a=np.array(BS.index.values)
+    b_valid=a.repeat(len(s1))
+    b_test=a.repeat(len(s2))
+    W_valid.extend(b_valid.tolist())
+    W_test.extend(b_test.tolist())
+
+
+# In[35]:
+
+
+yhat_new = yhat*W_valid
+error = rmspe(np.exp(y_valid), np.exp(yhat_new))
+print ('RMSPE for weight corretion {:6f}'.format(error))
+
+
+# In[36]:
+
+
+print("Make predictions on the test set")
+#y_test=np.log(test.Sales)
+dtest=xgb.DMatrix(x_test) 
+test_probs = gbm.predict(dtest)
+# Make Submission
+#result = pd.DataFrame({"Id": test["Id"], 'Sales': np.expm1(test_probs)})
+result = pd.DataFrame({"Id": test["Id"], 'Sales':np.exp(test_probs)})
+result.to_csv("Rossmann_submission_xgboost1.csv", index=False)
+#np.savetxt('xgb_submission1.csv',np.c_[range(1,len(test)+1),test_probs],delimiter=',',header='Id,Sales',comments=' ',fmt='%d') 
+# XGB feature importances
+
+
+# In[37]:
+
+
+result = pd.DataFrame({"Id": test["Id"], 'Sales':np.exp(test_probs*0.995)})
+result.to_csv("Rossmann_submission_xgboost2.csv", index=False)
+
+
+# In[38]:
+
+
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(test_probs*W_test)})
+result.to_csv("Rossmann_submission_xgboost3.csv", index=False)
+
+
+# In[39]:
+
+
+xgb.plot_importance(gbm)
+
+
+# In[40]:
+
+
+#训练模型融合
+
+
+# In[41]:
+
+
+print("Train an new ensemble XGBoost model")
+start =time.time()
+rounds = 10
+preds_valid = np.zeros((len(x_valid.index), rounds))
+preds_test = np.zeros((len(test.index), rounds))
+B=[]
+for r in range(rounds):
+    print('round {}:'.format(r+1))
+    
+    params = {"objective": "reg:linear",
+          "booster" : "gbtree",
+          "eta": 0.03,
+          "max_depth": 10,
+          "subsample": 0.9,
+          "colsample_bytree": 0.7,
+          "silent": 1,
+          "seed": r+1
+          }
+    num_boost_round = 3000
+    gbm = xgb.train(params, dtrain, num_boost_round, evals=watchlist, 
+                    early_stopping_rounds=100, feval=rmspe_xg, verbose_eval=True)
+    
+    yhat = gbm.predict(xgb.DMatrix(x_valid))
+    
+    L=range(1115)
+    W_valid=[]
+    W_test=[]
+    for i in L:
+        s1 = pd.DataFrame(df[df['Store']==i+1],columns = col_1)
+        s2 = pd.DataFrame(x_test[x_test['Store']==i+1])
+        W1=[(0.990+(i/1000)) for i in range(20)]
+        S =[]
+        for w in W1:
+            error = rmspe(np.exp(s1.Sales), np.exp(s1.Prediction*w))
+            S.append(error)
+        Score = pd.Series(S,index=W1)
+        BS = Score[Score.values == Score.values.min()]
+        a=np.array(BS.index.values)
+        b_valid=a.repeat(len(s1))
+        b_test=a.repeat(len(s2))
+        W_valid.extend(b_valid.tolist())
+        W_test.extend(b_test.tolist())
+ 
+    yhat_valid = yhat*W_valid
+    yhat_test =gbm.predict(xgb.DMatrix(x_test))*W_test
+    error = rmspe(np.exp(y_valid), np.exp(yhat_valid))
+    B.append(error)
+    preds_valid[:, r] = yhat_valid
+    preds_test[:, r] = yhat_test
+    print('round {} end'.format(r+1))
+    
+end =time.time()
+time_elapsed = end-start
+print('Training is end')
+print('Training time is {} h.'.format(time_elapsed/3600))   
+ 
+
+
+# In[42]:
+
+
+#分析各轮模型相关性
+
+
+# In[43]:
+
+
+preds = pd.DataFrame(preds_valid)
+sns.pairplot(preds)
+
+
+# In[44]:
+
+
+#模型融合表现——简单平均融合
+
+
+# In[46]:
+
+
+print ('Validating')
+bagged_valid_preds1 = preds_valid.mean(axis = 1)
+error1 = rmspe(np.exp(y_valid), np.exp(bagged_valid_preds1))
+print('RMSPE for mean: {:.6f}'.format(error1))
+
+
+# In[47]:
+
+
+#模型融合表现——加权融合
+
+
+# In[48]:
+
+
+R = range(10)   
+Mw = [0.20,0.20,0.10,0.10,0.10,0.10,0.00,0.00,0.10,0.10] 
+A = pd.DataFrame()
+A['round']=R
+A['best_score']=B
+A.sort_values(['best_score'],inplace = True)
+A['weight']=Mw
+A.sort_values(['round'],inplace = True)
+weight=np.array(A['weight'])
+preds_valid_w=weight*preds_valid
+bagged_valid_preds2 = preds_valid_w.sum(axis = 1)
+error2 = rmspe(np.exp(y_valid), np.exp(bagged_valid_preds2))
+print('RMSPE for weight: {:.6f}'.format(error2))
+
+
+# In[49]:
+
+
+#预测——均值融合和加权融合
+
+
+# In[50]:
+
+
+#平均融合
+print("Make predictions on the test set")
+bagged_preds = preds_test.mean(axis = 1)
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(bagged_preds)})
+result.to_csv("Rossmann_submission_xgbbagging1.csv", index=False)
+#加权融合
+bagged_preds = (preds_test*weight).sum(axis = 1)
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(bagged_preds)})
+result.to_csv("Rossmann_submission_xgbbagging2.csv", index=False)
+ 
+
+
+# In[51]:
+
+
+xgb.plot_importance(gbm)
+
+
+# In[52]:
+
+
+#模型融合权值在验证集预测结果
+
+
+# In[53]:
+
+
+df1 = pd.DataFrame(data = y_valid)
+df1['Prediction']=bagged_valid_preds2
+df1 = pd.merge(x_valid,df1, left_index= True, right_index=True)
+df1['Ratio'] = df1.Prediction/df.Sales
+df1['Error'] =abs(df1.Ratio-1)
+df1.head()
+ 
+
+
+# In[54]:
+
+
+#分析偏差最大的十个预测结果与初始模型差异
+
+
+# In[55]:
+
+
+df1.sort_values(['Error'],ascending=False,inplace= True)
+df['Store_new'] = df1['Store']
+df['Error_new'] = df1['Error']
+df['Ratio_new'] = df1['Ratio']
+col_3 = ['Store','Ratio','Error','Store_new','Ratio_new','Error_new']
+com = pd.DataFrame(df,columns = col_3)
+com[:10]
+ 
+
+
+# In[77]:
+
+
+#LGBM模型训练
+
+
+# In[78]:
+
+
+import lightgbm as lgb
+from sklearn.metrics import mean_squared_error
+
+
+# In[79]:
+
+
+print("Train a new ensemble LGBM model")
+start=time.time()
+rounds=10
+preds_valid_lgb=np.zeros((len(x_valid.index),rounds))
+preds_test_lgb=np.zeros((len(test.index),rounds))
+B_lgb=[]
+
+
+# In[80]:
+
+
+def rmsle(y_true, y_pred):
+    return 'RMSLE', np.sqrt(np.mean(np.power(np.log1p(y_pred) - np.log1p(y_true), 2))), False
+
+
+# In[81]:
+
+
+for r in range(rounds):
+    print('round{}:'.format(r+1))
+    params = {
+    'task': 'train',
+    'boosting_type': 'gbdt',  # 设置提升类型
+    'objective': 'regression', # 目标函数
+    'metric': {'l2', 'l2_root','RMSLE'},  # 评估函数
+    'num_leaves': 31,   # 叶子节点数
+    'learning_rate': 0.01,  # 学习速率
+    'feature_fraction': 0.9, # 建树的特征选择比例
+    'bagging_fraction': 0.8, # 建树的样本采样比例
+    'bagging_freq': 5,  # k 意味着每 k 次迭代执行bagging
+    'verbose': 1 ,# <0 显示致命的, =0 显示错误 (警告), >0 显示信息
+    'seed':r+1
+    }
+
+    lgb_train = lgb.Dataset(x_train, y_train) # 将数据保存到LightGBM二进制文件将使加载更快
+    lgb_eval = lgb.Dataset(x_valid, y_valid, reference=lgb_train)  # 创建验证数据
+
+    
+    gbm=lgb.train(params,lgb_train,num_boost_round=4000,valid_sets=lgb_eval,early_stopping_rounds=5)
+    gbm.save_model('model.txt')
+    yhat_lgb=gbm.predict(x_valid,num_iteration=gbm.best_iteration)
+    
+        
+    L=range(1115)
+    W_valid_lgb=[]
+    W_test_lgb=[]
+    for i in L:
+        s1 = pd.DataFrame(df[df['Store']==i+1],columns = col_1)
+        s2 = pd.DataFrame(x_test[x_test['Store']==i+1])
+        W1=[(0.990+(i/1000)) for i in range(20)]
+        S =[]
+        for w in W1:
+            error = rmspe(np.exp(s1.Sales), np.exp(s1.Prediction*w))
+            S.append(error)
+        Score = pd.Series(S,index=W1)
+        BS = Score[Score.values == Score.values.min()]
+        a=np.array(BS.index.values)
+        b_valid=a.repeat(len(s1))
+        b_test=a.repeat(len(s2))
+        W_valid_lgb.extend(b_valid.tolist())
+        W_test_lgb.extend(b_test.tolist())
+ 
+    yhat_valid_lgb = yhat_lgb*W_valid_lgb
+    yhat_test_lgb =gbm.predict(x_test)*W_test_lgb
+    error = rmspe(np.exp(y_valid), np.exp(yhat_valid))
+    B_lgb.append(error)
+    preds_valid_lgb[:, r] = yhat_valid_lgb
+    preds_test_lgb[:, r] = yhat_test_lgb
+    print('round {} end'.format(r+1))
+    
+    
+    
+    
+    print('RMSPE: {:.6f}'.format(error))
+  
+
+
+# In[82]:
+
+
+end = time.time()
+time_elapsed = end-start
+print('Training is end')
+print('Training time is {} h.'.format(time_elapsed/3600))  
+
+
+# In[83]:
+
+
+preds_lgb = pd.DataFrame(preds_valid_lgb)
+sns.pairplot(preds_lgb)
+
+
+# In[84]:
+
+
+#LGMB读入预测数据
+df_lgb = pd.DataFrame(data = y_valid)
+df_lgb['Prediction_lgb']=yhat_valid_lgb
+df_lgb = pd.merge(x_valid,df_lgb, left_index= True, right_index=True)
+df_lgb['Ratio_lgb'] = df_lgb.Prediction_lgb/df_lgb.Sales
+df_lgb['Error_lgb'] =abs(df_lgb.Ratio_lgb-1)
+df_lgb['Weight_lgb'] = df_lgb.Sales/df_lgb.Prediction_lgb
+df_lgb.head()
+
+
+# In[85]:
+
+
+col_1_lgb = ['Sales','Prediction_lgb']
+col_2_lgb = ['Ratio_lgb']
+L=np.random.randint( low=1,high = 1115, size = 3 ) 
+print('LGB Mean Ratio of predition and real sales data is {}: store all'.format(df_lgb.Ratio_lgb.mean()))
+for i in L:
+    
+    s1_lgb = pd.DataFrame(df_lgb[df_lgb['Store']==i],columns = col_1_lgb)
+    s2_lgb = pd.DataFrame(df_lgb[df_lgb['Store']==i],columns = col_2_lgb)
+    s1_lgb.plot(title = 'LGB Comparation of predition and real sales data: store {}'.format(i),figsize=(12,4))
+    s2_lgb.plot(title = 'LGB Ratio of predition and real sales data: store {}'.format(i),figsize=(12,4))
+    print('LGB Mean Ratio of predition and real sales data is {}: store {}'.format(s2_lgb.Ratio_lgb.mean(),i))
+
+
+# In[86]:
+
+
+df_lgb.sort_values(['Error_lgb'],ascending=False,inplace= True)
+df_lgb[:10]
+
+
+# In[87]:
+
+
+#计算总体权重
+print("LGBM weight correction")
+W_lgb=[(0.990+(i/1000)) for i in range(20)]
+S =[]
+for w in W_lgb:
+    error = rmspe(np.exp(y_valid), np.exp(yhat_lgb*w))
+    print('RMSPE for {:.3f}:{:.6f}'.format(w,error))
+    S.append(error)
+Score = pd.Series(S,index=W_lgb)
+Score.plot()
+BS = Score[Score.values == Score.values.min()]
+print ('LGBM Best weight for Score:{}'.format(BS))
+
+
+# In[88]:
+
+
+L=range(1115)
+W_valid_lgb=[]
+W_test_lgb=[]
+for i in L:
+    s1 = pd.DataFrame(df[df['Store']==i+1],columns = col_1)
+    s2 = pd.DataFrame(x_test[x_test['Store']==i+1])
+    W1=[(0.990+(i/1000)) for i in range(20)]
+    S =[]
+    for w in W1:
+        error = rmspe(np.exp(s1.Sales), np.exp(s1.Prediction*w))
+        S.append(error)
+    Score = pd.Series(S,index=W1)
+    BS = Score[Score.values == Score.values.min()]
+    a=np.array(BS.index.values)
+    b_valid=a.repeat(len(s1))
+    b_test=a.repeat(len(s2))
+    W_valid_lgb.extend(b_valid.tolist())
+    W_test_lgb.extend(b_test.tolist())
+
+
+# In[89]:
+
+
+yhat_valid_lgb2 = yhat_valid_lgb*W_valid_lgb
+error = rmspe(np.exp(y_valid), np.exp(yhat_valid_lgb2))
+print ('RMSPE for weight corretion {:6f}'.format(error))
+
+
+# In[90]:
+
+
+#初始模型
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(yhat_test_lgb)})
+result.to_csv("Rossmann_submission_LGBM1.csv", index=False)
+
+
+# In[91]:
+
+
+#整体校正模型
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(yhat_test_lgb*0.99)})
+result.to_csv("Rossmann_submission_LGBM2.csv", index=False)
+
+
+# In[92]:
+
+
+#细致校正模型
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(yhat_test_lgb*W_test_lgb)})
+result.to_csv("Rossmann_submission_LGBM3.csv", index=False)
+
+
+# In[93]:
+
+
+#LGMB算法均值融合结果
+bagged_valid_preds1 = preds_valid_lgb.mean(axis = 1)
+error1 = rmspe(np.exp(y_valid), np.exp(bagged_valid_preds1))
+print('RMSPE for mean: {:.6f}'.format(error1))
+bagged_preds_lgb=preds_test_lgb.mean(axis=1)
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(bagged_preds_lgb)})
+result.to_csv("Rossmann_submission_LGBMbagging1.csv", index=False)
+
+
+# In[94]:
+
+
+#LGMB算法加权融合结果
+R_lgb = range(10)   
+Mw = [0.10,0.20,0.10,0.10,0.00,0.10,0.10,0.00,0.20,0.10] 
+A_lgb = pd.DataFrame()
+A_lgb['round_lgb']=R_lgb
+A_lgb['best_score_lgb']=B_lgb
+A_lgb.sort_values(['best_score_lgb'],inplace = True)
+A_lgb['weight_lgb']=Mw
+A_lgb.sort_values(['round_lgb'],inplace = True)
+weight_lgb=np.array(A_lgb['weight_lgb'])
+preds_valid_w=weight_lgb*preds_valid_lgb
+bagged_valid_preds2 = preds_valid_w.sum(axis = 1)
+error2 = rmspe(np.exp(y_valid), np.exp(bagged_valid_preds2))
+print('RMSPE for weight: {:.6f}'.format(error2))
+ 
+
+bagged_preds_lgb = (preds_test_lgb*weight_lgb).sum(axis = 1)
+result = pd.DataFrame({"Id": test['Id'], 'Sales': np.exp(bagged_preds_lgb)})
+result.to_csv("Rossmann_submission_LGBMbagging2.csv", index=False)
+ 
+
+
+# In[95]:
+
+
+lgb.plot_importance(gbm)
+
